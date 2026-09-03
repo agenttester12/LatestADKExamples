@@ -751,10 +751,10 @@ tool outputs, workflow logic, or native-agent prose.
 
 Because IBM does not translate native-agent tool output automatically, each
 agent must translate the natural-language prose in employee-facing tool `text`
-when `response_language` is present. It must preserve the meaning and every
+according to `response_language`. It must preserve the meaning and every
 card payload, date, Workday value, ID, URL, action type, status, and other
-factual or opaque value. When `response_language` is absent, the tool text and
-all other conversational prose stay in English.
+factual or opaque value. If `response_language` is unexpectedly absent or
+invalid, the tool text and all other conversational prose stay in English.
 
 AskHR already owns the native-agent language boundary in `chatMessage.ts`:
 
@@ -763,20 +763,110 @@ AskHR already owns the native-agent language boundary in `chatMessage.ts`:
 2. Global language support and multilingual mode must be enabled.
 3. The current turn's resolved non-English locale must appear in the App Config
    value `AskHR:AgentResponseLanguages`.
-4. Only then does AskHR add `response_language` to the WxO run context. English
-   and unsupported locales are omitted, so the agents fall back to English.
+4. The locale must also appear in AskHR's fixed IBM WxO transactional ceiling.
+5. AskHR sends the approved non-English locale when all checks pass; otherwise
+   it sends `response_language: "en"`. The agent never has to infer the fallback
+   from a Polish or other unsupported-language message.
 
-Populate `AskHR:AgentResponseLanguages` only with BCP 47 locale codes that have
-passed live output-quality checks for the deployed WxO model. The list is
-operator-owned and may be narrower than the knowledge taxonomy or widget
-catalogs. Empty means no non-English agent response is authorized. Do not use
-another identity-context field as a fallback inside either agent; that would
-bypass the current-turn resolution and the vetted agent-output allowlist.
+### Backend implementation specification
+
+The broader knowledge-language taxonomy is not the WxO capability boundary.
+Do not remove or narrow knowledge languages to implement this change. Instead,
+edit `packages/backend/src/services/config/featureFlags.ts` and place one
+immutable non-English ceiling beside `AskHR:AgentResponseLanguages`:
+
+```ts
+const WXO_TRANSACTIONAL_RESPONSE_LANGUAGES = new Set([
+  'fr',
+  'es',
+  'de',
+  'it',
+  'ja',
+  'ko',
+  'zh-CN',
+  'zh-TW',
+  'pt-BR',
+]);
+```
+
+English is deliberately absent from this set because it is not configurable;
+AskHR sends it as the explicit fallback. Filter the already-canonicalized App
+Configuration list against the set:
+
+```ts
+function parseLanguageList(raw: string): string[] {
+  return canonicalizeLanguageList(
+    raw.split(',').map(language => language.trim()).filter(Boolean),
+  ).filter(language => WXO_TRANSACTIONAL_RESPONSE_LANGUAGES.has(language));
+}
+```
+
+In `packages/backend/src/routes/chatMessage.ts`, initialize the effective
+transactional language to English before checking the approved non-English
+subset:
+
+```ts
+let responseLanguage = 'en';
+if (agent.contextProfile?.fields.includes('response_language') &&
+    (await isMultilingualEnabled())) {
+  const resolved = turnCtx.language;
+  const enabledLanguages = await getAgentResponseLanguages();
+  if (resolved !== 'en' && enabledLanguages.includes(resolved)) {
+    responseLanguage = resolved;
+  }
+}
+```
+
+Continue passing that value through the existing `buildAgentContext` call. The
+context builder emits it only for agents whose profile selects
+`response_language`. This makes an unsupported Polish transactional turn
+unambiguous: routing still sees the Polish request, but WxO receives
+`response_language: "en"` and follows the English instruction.
+
+Reuse the existing parser, 30-second cache, coalesced App Configuration read,
+and warm last-known-good behavior. Do not add another service, network call,
+connection value, agent-local locale list, or environment-variable override.
+The filtering happens only when the cached setting is refreshed; normal turns
+perform a cached membership check, so this adds no material request-path work.
+
+### App Configuration
+
+Set these existing keys for each environment where localized transactional
+agent output is approved:
+
+```text
+AskHR:LanguageSupportEnabled = true
+AskHR:MultilingualEnabled = true
+AskHR:AgentResponseLanguages = fr,es,de,it,ja,ko,zh-CN,zh-TW,pt-BR
+```
+
+`AskHR:AgentResponseLanguages` may contain a narrower rollout subset. It can
+never widen the code ceiling: knowledge-only values such as `nl` or `pl`,
+malformed tags, and English are discarded. Empty or unavailable cold
+configuration means English-only transactional agents. Do not put this list in
+`EVLConnection`, `FlexWork`, or a process environment variable; those are not
+the authority for conversational behavior.
+
+### Required behavior
+
+| Current-turn locale | Knowledge support | Configured transactional subset | WxO context |
+| --- | --- | --- | --- |
+| `es` | supported | contains `es` | `response_language: "es"` |
+| `pt_BR` | supported | contains `pt-BR` | canonicalized to `response_language: "pt-BR"` |
+| `nl` | supported | even if mistakenly configured | `response_language: "en"` |
+| `en` | supported | any value | `response_language: "en"` |
+| malformed/unknown | irrelevant | any value | `response_language: "en"` |
+
+Do not use another identity-context field as a fallback inside either agent;
+that would bypass the current-turn resolution and the transactional ceiling.
 
 Retain the existing backend tests proving that an approved locale such as `es`
 is emitted, a configured regional locale such as `pt-BR` keeps its exact form,
-English is omitted, and unsupported or unvetted locales are omitted. In the
-agent package, retain the test that both YAML instructions use only
+English, unsupported, and unvetted locales produce explicit `en`. Add a
+`featureFlags.test.ts` case proving that canonicalization and deduplication run
+before the IBM ceiling, and that `nl`, `pl`, and `en` cannot enter the effective
+non-English list even when an operator configures them. In the agent package,
+retain the test that both YAML instructions use only
 `response_language`, translate employee-facing tool prose when it is present,
 and fail closed to English.
 
@@ -831,6 +921,29 @@ Local verification cannot prove tenant wiring. Before enabling an environment:
       `askhr_platform_tools:report_action`.
 - [ ] Cards validate against the existing AskHR ChatBlock schema.
 - [ ] Current handbook and Postman descriptions match runtime behavior.
+- [ ] `WXO_TRANSACTIONAL_RESPONSE_LANGUAGES` contains only `fr`, `es`, `de`,
+      `it`, `ja`, `ko`, `zh-CN`, `zh-TW`, and `pt-BR`; English remains the
+      explicit fallback outside the configurable set.
+- [ ] `AskHR:AgentResponseLanguages` selects only a subset and cannot enable a
+      knowledge-only locale for WxO.
+- [ ] `nl` can remain available to knowledge while a WxO turn sends
+      `response_language: "en"` and answers in English.
+- [ ] Each enabled non-English transactional locale passes a DEV/QA live prose,
+      tool-text, failure, and mid-conversation switch smoke test.
 - [ ] Targeted tests and the complete `npm run verify` gate pass freshly.
 - [ ] Remaining tenant smoke tests are recorded explicitly; no untested agent is
       silently enabled or published.
+
+## When to mark the work complete
+
+Mark the **AskHR source implementation** complete only when every final
+acceptance item above is satisfied, the full repository verification gate is
+green, and the work-PC branch contains the backend ceiling, regression test,
+handbook updates, and environment-specific App Configuration plan.
+
+Mark an **environment deployment** complete only when its three App
+Configuration values are applied, the toolkits and agents import under their
+exact names, all connection/card/token/write checks pass, and every enabled
+non-English transactional locale passes the live smoke tests. A successful
+import by itself is not completion. Keep the registry shells environment-
+disabled until this evidence is recorded.

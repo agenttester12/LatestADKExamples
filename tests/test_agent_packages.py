@@ -106,6 +106,7 @@ class AgentPackageTests(unittest.TestCase):
             spec = yaml.safe_load((ROOT / "Agents" / filename).read_text())
             instructions = spec["instructions"]
             self.assertIn("operator-vetted non-English locale", instructions)
+            self.assertIn("`en` as the explicit fallback", instructions)
             self.assertIn(
                 "If `response_language` is absent, empty, or malformed, write in English.",
                 instructions,

@@ -53,13 +53,15 @@ impersonate the employee and are not the Workday OBO flow.
 These are native agents, so IBM's agentic-workflow translation files do not
 control their conversational responses. AskHR owns the runtime decision:
 
-- `response_language` is included only for a non-English locale currently
-  approved in `AskHR:AgentResponseLanguages`.
+- `response_language` carries the effective transactional response language on
+  every opted-in turn: an approved non-English locale within AskHR's fixed IBM
+  WxO ceiling, or `en` for every other case.
 - When it is present and well formed, both agents write all conversational
   prose in that locale, including a faithful translation of the human-readable
   `text` returned by their tools.
-- When it is absent, empty, or malformed, both agents use English. They do not
-  infer a different response language from the message or another context field.
+- If the field is unexpectedly absent, empty, or malformed, both agents still
+  use English. They do not infer a different response language from the message
+  or another context field.
 - ChatBlock card labels and Workday values remain unchanged. EVL's separate
   `language` tool argument controls the requested document template, not the
   conversation language.
@@ -69,8 +71,11 @@ not apply to these native agents. The native-agent instructions therefore own
 the tool-text translation rule. Cards and factual or opaque values stay
 unchanged.
 
-Keep `AskHR:AgentResponseLanguages` limited to locales proven acceptable with
-the deployed model. An empty setting is the safe English-only default.
+The non-English ceiling is `fr`, `es`, `de`, `it`, `ja`, `ko`, `zh-CN`,
+`zh-TW`, and `pt-BR`; English is the explicit fallback. This is independent of
+AskHR's broader knowledge-language taxonomy. Configure the desired subset in
+`AskHR:AgentResponseLanguages`; an empty setting is the safe English-only
+default.
 
 ## Import order
 

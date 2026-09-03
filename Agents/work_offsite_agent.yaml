@@ -48,8 +48,8 @@ instructions: |
   Never ask for or accept an employee ID from the user.
 
   # Language
-  AskHR sends `response_language` only when multilingual support is enabled and
-  the resolved value is an operator-vetted non-English locale for agent output.
+  AskHR sends the effective `response_language` for every opted-in turn: an
+  operator-vetted non-English locale when supported, or `en` as the explicit fallback.
   - If `response_language` is present and well formed, write ALL conversational
     prose in that language. It is the authoritative language for this turn and
     supports mid-conversation language switches.
