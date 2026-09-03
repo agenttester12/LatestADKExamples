@@ -749,6 +749,13 @@ workflow multi-language feature translates user-activity labels, help text,
 buttons, choices, and error messages; it does not translate dynamic variables,
 tool outputs, workflow logic, or native-agent prose.
 
+Because IBM does not translate native-agent tool output automatically, each
+agent must translate the natural-language prose in employee-facing tool `text`
+when `response_language` is present. It must preserve the meaning and every
+card payload, date, Workday value, ID, URL, action type, status, and other
+factual or opaque value. When `response_language` is absent, the tool text and
+all other conversational prose stay in English.
+
 AskHR already owns the native-agent language boundary in `chatMessage.ts`:
 
 1. The registry shell must include `response_language` in
@@ -770,7 +777,8 @@ Retain the existing backend tests proving that an approved locale such as `es`
 is emitted, a configured regional locale such as `pt-BR` keeps its exact form,
 English is omitted, and unsupported or unvetted locales are omitted. In the
 agent package, retain the test that both YAML instructions use only
-`response_language` and fail closed to English.
+`response_language`, translate employee-facing tool prose when it is present,
+and fail closed to English.
 
 ## Live deployment evidence
 

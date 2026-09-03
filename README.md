@@ -56,12 +56,18 @@ control their conversational responses. AskHR owns the runtime decision:
 - `response_language` is included only for a non-English locale currently
   approved in `AskHR:AgentResponseLanguages`.
 - When it is present and well formed, both agents write all conversational
-  prose in that locale.
+  prose in that locale, including a faithful translation of the human-readable
+  `text` returned by their tools.
 - When it is absent, empty, or malformed, both agents use English. They do not
   infer a different response language from the message or another context field.
 - ChatBlock card labels and Workday values remain unchanged. EVL's separate
   `language` tool argument controls the requested document template, not the
   conversation language.
+
+IBM's agentic-workflow translation bundles do not translate tool outputs and do
+not apply to these native agents. The native-agent instructions therefore own
+the tool-text translation rule. Cards and factual or opaque values stay
+unchanged.
 
 Keep `AskHR:AgentResponseLanguages` limited to locales proven acceptable with
 the deployed model. An empty setting is the safe English-only default.

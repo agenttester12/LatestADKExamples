@@ -111,6 +111,10 @@ class AgentPackageTests(unittest.TestCase):
                 instructions,
             )
             self.assertIn("Do not infer the response language", instructions)
+            self.assertIn("Tool `text` is part of the employee-facing reply.", instructions)
+            self.assertIn("translate its natural-language prose faithfully", instructions)
+            self.assertNotRegex(instructions, r"relay(?: the)?(?: returned| tool's)? text (?:exactly|as-is)")
+            self.assertNotIn("Only your own prose is translated", instructions)
             self.assertNotIn("only if you can write", instructions.lower())
             self.assertNotIn('If `response_language` is "es"', instructions)
 
