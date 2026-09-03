@@ -1,0 +1,2 @@
+ibm-watsonx-orchestrate==2.15.0
+httpx==0.28.1
