@@ -71,15 +71,51 @@ class AgentPackageTests(unittest.TestCase):
         cls.offsite = _load_module("offsite_tools_under_test", "Tools/work_offsite_toolkit/tools.py")
 
     def test_agent_specs_attach_platform_tools_and_use_supported_styles(self):
-        for filename in ("evl_agent.yaml", "work_offsite_agent.yaml"):
+        expected_tools = {
+            "evl_agent.yaml": [
+                "evl_tools:evl_tools",
+                "askhr_platform_tools:stage_card",
+                "askhr_platform_tools:report_action",
+            ],
+            "work_offsite_agent.yaml": [
+                "work_offsite_toolkit:view_offsite_requests",
+                "work_offsite_toolkit:list_offsite_requests_for_action",
+                "work_offsite_toolkit:validate_offsite_request",
+                "work_offsite_toolkit:submit_offsite_request",
+                "work_offsite_toolkit:cancel_offsite_request",
+                "work_offsite_toolkit:modify_offsite_request",
+                "work_offsite_toolkit:get_offsite_reasons",
+                "askhr_platform_tools:stage_card",
+                "askhr_platform_tools:report_action",
+            ],
+        }
+        for filename, tool_names in expected_tools.items():
             spec = yaml.safe_load((ROOT / "Agents" / filename).read_text())
             self.assertIn(spec["style"], {"default", "react", "react_core"})
             self.assertTrue(spec["hide_reasoning"])
-            self.assertIn("stage_card", spec["tools"])
-            self.assertIn("report_action", spec["tools"])
+            self.assertEqual(spec["tools"], tool_names)
 
         evl_spec = yaml.safe_load((ROOT / "Agents/evl_agent.yaml").read_text())
         self.assertIn("session_id", evl_spec["context_variables"])
+        self.assertTrue(
+            all(guideline["tool"] == "evl_tools:evl_tools" for guideline in evl_spec["guidelines"])
+        )
+
+    def test_agent_language_contract_uses_only_vetted_context(self):
+        for filename in ("evl_agent.yaml", "work_offsite_agent.yaml"):
+            spec = yaml.safe_load((ROOT / "Agents" / filename).read_text())
+            instructions = spec["instructions"]
+            self.assertIn("operator-vetted non-English locale", instructions)
+            self.assertIn(
+                "If `response_language` is absent, empty, or malformed, write in English.",
+                instructions,
+            )
+            self.assertIn("Do not infer the response language", instructions)
+            self.assertNotIn("only if you can write", instructions.lower())
+            self.assertNotIn('If `response_language` is "es"', instructions)
+
+        offsite_spec = yaml.safe_load((ROOT / "Agents/work_offsite_agent.yaml").read_text())
+        self.assertNotIn("preferred_language", offsite_spec["context_variables"])
 
     def test_requirements_use_exact_stable_versions(self):
         for path in (

@@ -1,8 +1,9 @@
 # AskHR WxO agents
 
 Deployable watsonx Orchestrate definitions for EVL and Work Offsite. Both use
-AskHR ChatBlock cards through the shared `stage_card` control tool and report
-only confirmed successful writes through `report_action`.
+AskHR ChatBlock cards through the shared
+`askhr_platform_tools:stage_card` control tool and report only confirmed
+successful writes through `askhr_platform_tools:report_action`.
 
 ## Runtime contract
 
@@ -47,6 +48,24 @@ The `client_credentials` calls in these toolkits are separate service-to-service
 authentication for the EVL document service and FlexWork APIs. They do not
 impersonate the employee and are not the Workday OBO flow.
 
+## Response-language contract
+
+These are native agents, so IBM's agentic-workflow translation files do not
+control their conversational responses. AskHR owns the runtime decision:
+
+- `response_language` is included only for a non-English locale currently
+  approved in `AskHR:AgentResponseLanguages`.
+- When it is present and well formed, both agents write all conversational
+  prose in that locale.
+- When it is absent, empty, or malformed, both agents use English. They do not
+  infer a different response language from the message or another context field.
+- ChatBlock card labels and Workday values remain unchanged. EVL's separate
+  `language` tool argument controls the requested document template, not the
+  conversation language.
+
+Keep `AskHR:AgentResponseLanguages` limited to locales proven acceptable with
+the deployed model. An empty setting is the safe English-only default.
+
 ## Import order
 
 From this directory, replace `<tenant-tier>` with the dedicated Python-toolkit
@@ -71,6 +90,25 @@ orchestrate agents import -f Agents/work_offsite_agent.yaml
 
 IBM requires `--tier` for Python toolkits. Confirm the permitted tier with the
 tenant administrator; do not guess or omit it.
+
+Toolkit imports expose tools as `toolkit_name:tool_name`. Before importing the
+agents, verify that `orchestrate tools list -v` includes these exact names:
+
+```text
+evl_tools:evl_tools
+work_offsite_toolkit:view_offsite_requests
+work_offsite_toolkit:list_offsite_requests_for_action
+work_offsite_toolkit:validate_offsite_request
+work_offsite_toolkit:submit_offsite_request
+work_offsite_toolkit:cancel_offsite_request
+work_offsite_toolkit:modify_offsite_request
+work_offsite_toolkit:get_offsite_reasons
+askhr_platform_tools:stage_card
+askhr_platform_tools:report_action
+```
+
+The agent YAML files intentionally use those qualified names. Do not shorten
+them to bare Python function names after a toolkit import.
 
 After the WxO imports and connection tests pass, sync the agents into the
 matching AskHR environment, apply the repository agent configuration, run the

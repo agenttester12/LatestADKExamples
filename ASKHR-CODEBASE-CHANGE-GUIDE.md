@@ -24,7 +24,9 @@ After this change:
    ends the attempt and tells the employee to refresh/reopen AskHR.
 7. The removed temporary token gate no longer blocks agent publication,
    discovery, or dispatch.
-8. EVL and Work Offsite declare the `stage_card` and `report_action` tools needed
+8. EVL and Work Offsite declare the namespaced
+   `askhr_platform_tools:stage_card` and
+   `askhr_platform_tools:report_action` tools needed
    by the existing AskHR WxO run manager.
 9. AskHR bounds forced recovery to 10 requests per minute per session after
    authenticating the internal-agent caller.
@@ -396,7 +398,11 @@ Edit `config/agents/evl_agent.json` so the relevant fields are:
 
 ```json
 {
-  "toolNames": ["evl_tools", "stage_card", "report_action"],
+  "toolNames": [
+    "evl_tools:evl_tools",
+    "askhr_platform_tools:stage_card",
+    "askhr_platform_tools:report_action"
+  ],
   "contextProfile": {
     "fields": [
       "employee_id",
@@ -422,11 +428,21 @@ change.
 
 ### Work Offsite shell
 
-Edit `config/agents/work_offsite.json` and append:
+Edit `config/agents/work_offsite.json` so `toolNames` is the imported toolkit
+surface, including the shared control toolkit:
 
 ```json
-"stage_card",
-"report_action"
+"toolNames": [
+  "work_offsite_toolkit:view_offsite_requests",
+  "work_offsite_toolkit:list_offsite_requests_for_action",
+  "work_offsite_toolkit:validate_offsite_request",
+  "work_offsite_toolkit:submit_offsite_request",
+  "work_offsite_toolkit:cancel_offsite_request",
+  "work_offsite_toolkit:modify_offsite_request",
+  "work_offsite_toolkit:get_offsite_reasons",
+  "askhr_platform_tools:stage_card",
+  "askhr_platform_tools:report_action"
+]
 ```
 
 Do not configure Work Offsite for the employee OBO token. Its transferred tools
@@ -521,7 +537,8 @@ The documentation must say all of the following consistently:
 - Publication now has the existing platform, geography, and readiness checks;
   there is no separate token-policy gate.
 - Discovery has six base gates, plus the separate fresh dispatchability result.
-- Both agents use in-stream `stage_card` and `report_action` tool calls.
+- Both agents use in-stream `askhr_platform_tools:stage_card` and
+  `askhr_platform_tools:report_action` tool calls.
 
 Update the Postman resolve-token request description with the same forced
 backend-recovery semantics. The request body itself does not change.
@@ -616,12 +633,42 @@ Expected result: HTTP 400 `Unexpected fields`, with no token lookup or exchange.
 
 ## Card and action contract
 
-No new card framework is required in AskHR. The existing WxO run manager already
-intercepts tool calls:
+No new card framework is required in AskHR. IBM Python toolkit imports expose
+tools as `toolkit_name:tool_name`, so update `wxoRunManager.ts` to recognize the
+two exact namespaced controls. Do not retain bare names or match arbitrary names
+by suffix:
+
+```ts
+const STAGE_CARD_TOOL_NAME = "askhr_platform_tools:stage_card";
+const REPORT_ACTION_TOOL_NAME = "askhr_platform_tools:report_action";
+```
+
+Pass the dispatched registry entry's `toolNames` into `sendWxOMessage`. Build a
+set once per run and check every streamed name before parsing its arguments or
+performing any side effect. For a name that is not attached to that agent, add
+only the fixed marker `unrecognized_tool` to telemetry and continue. Never put
+the raw unknown name into telemetry, logs, reasoning SSE, or analytics: the WxO
+stream is external input and the name could contain employee data or a token.
+For an allowed event, continue recording the exact qualified name for useful
+deployment telemetry.
+
+Pass `[agent.name]` as a separate trusted display-name allowlist. Accept
+`step_details[].agent_display_name` into telemetry only when it exactly matches
+that configured value. Otherwise ignore it. Do not use a raw provider display
+name in widget reasoning or as the persisted analytics `agentKey`; it is also
+external text and can carry employee data or secrets. If a future supervisor
+needs collaborator-level telemetry, add the expected collaborator names to the
+registry contract explicitly rather than accepting arbitrary stream values.
+
+Use exact equality with `STAGE_CARD_TOOL_NAME` and `REPORT_ACTION_TOOL_NAME` at
+the existing interception points. This prevents an unrelated toolkit or a bare
+legacy name from impersonating a control tool.
+
+The run manager then intercepts a toolkit event such as:
 
 ```json
 {
-  "name": "stage_card",
+  "name": "askhr_platform_tools:stage_card",
   "args": {
     "card": {
       "kind": "confirm",
@@ -646,8 +693,8 @@ expired, forged, and replayed submissions are rejected before agent dispatch.
 Keep that existing boundary intact; it is why the tool-level `confirmed=false`
 default is defense in depth rather than the sole confirmation control.
 
-The transferred agents emit `report_action` only after a tool result explicitly
-confirms success. The HTTP `report-action` callback remains a no-op
+The transferred agents emit `askhr_platform_tools:report_action` only after a
+tool result explicitly confirms success. The HTTP `report-action` callback remains a no-op
 acknowledgement; actual transaction telemetry comes from the in-stream tool call.
 
 ## Verification
@@ -695,6 +742,36 @@ dependency folders, temporary cards, and synthetic inputs must not appear in
 the change unless they are already tracked outputs intentionally refreshed by
 the repository workflow.
 
+## Response-language configuration
+
+Do not add IBM agentic-workflow locale files for these native agents. IBM's
+workflow multi-language feature translates user-activity labels, help text,
+buttons, choices, and error messages; it does not translate dynamic variables,
+tool outputs, workflow logic, or native-agent prose.
+
+AskHR already owns the native-agent language boundary in `chatMessage.ts`:
+
+1. The registry shell must include `response_language` in
+   `contextProfile.fields` (both transferred shells do).
+2. Global language support and multilingual mode must be enabled.
+3. The current turn's resolved non-English locale must appear in the App Config
+   value `AskHR:AgentResponseLanguages`.
+4. Only then does AskHR add `response_language` to the WxO run context. English
+   and unsupported locales are omitted, so the agents fall back to English.
+
+Populate `AskHR:AgentResponseLanguages` only with BCP 47 locale codes that have
+passed live output-quality checks for the deployed WxO model. The list is
+operator-owned and may be narrower than the knowledge taxonomy or widget
+catalogs. Empty means no non-English agent response is authorized. Do not use
+another identity-context field as a fallback inside either agent; that would
+bypass the current-turn resolution and the vetted agent-output allowlist.
+
+Retain the existing backend tests proving that an approved locale such as `es`
+is emitted, a configured regional locale such as `pt-BR` keeps its exact form,
+English is omitted, and unsupported or unvetted locales are omitted. In the
+agent package, retain the test that both YAML instructions use only
+`response_language` and fail closed to English.
+
 ## Live deployment evidence
 
 Local verification cannot prove tenant wiring. Before enabling an environment:
@@ -716,7 +793,8 @@ Local verification cannot prove tenant wiring. Before enabling an environment:
    AskHR widget.
 9. Confirm cancel/modify uses the opaque `requestRef` returned by the selected
    row and cannot target a reordered request.
-10. Confirm `report_action` is emitted only after an explicit successful write.
+10. Confirm `askhr_platform_tools:report_action` is emitted only after an
+    explicit successful write.
 11. Sync the WxO agent identifiers into the matching AskHR environment, apply
     the registry configuration, run the AskHR agent connection test, and only
     then publish/enable that environment.
@@ -741,7 +819,8 @@ Local verification cannot prove tenant wiring. Before enabling an environment:
 - [ ] EVL uses the payload token first and requests recovery only after missing
       auth or Workday 401/403.
 - [ ] The WxO tools contain no IDP/SAML/OBO exchange implementation.
-- [ ] Both shells and YAML agents declare `stage_card` and `report_action`.
+- [ ] Both shells and YAML agents declare `askhr_platform_tools:stage_card` and
+      `askhr_platform_tools:report_action`.
 - [ ] Cards validate against the existing AskHR ChatBlock schema.
 - [ ] Current handbook and Postman descriptions match runtime behavior.
 - [ ] Targeted tests and the complete `npm run verify` gate pass freshly.
