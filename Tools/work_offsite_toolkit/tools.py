@@ -7,13 +7,13 @@ Each tool returns a dict with human-readable ``text`` and, where an interactive
 step helps, a ``card`` — a ChatBlock the agent stages verbatim through
 ``stage_card`` so the widget can render it.
 
-Everything lives in one module so it imports with a single
-``orchestrate tools import -k python -f tools.py``.
+Everything lives in one module so the directory imports as the namespaced
+``work_offsite_toolkit`` Python toolkit.
 
 A few things worth knowing:
 
-* ``employee_id`` comes from the run context and is subject-bound — the tools
-  never accept an employee id as an argument, so the subject can't be spoofed.
+* ``employee_id`` and the employee-local ``current_date`` come from run
+  context. The tools never accept either as a model-supplied argument.
 * Credentials are a service account from the ``FlexWork`` connection, cached
   process-wide across users behind a lock.
 * Workday has no native "modify", so modify = cancel/rescind the old request
@@ -52,17 +52,39 @@ _CANCEL_MODIFY_DAYS = 180    # cancel/modify show six months of history
 _WORKDAY_API_VERSION = "v43.0"
 MAX_TABLE_ROWS = 25          # cap staged card/table size
 
-# Valid reasons, resolved in code so the reason is never LLM-guessed.
-_REASONS: list[tuple[str, str]] = [
-    ("Business Reason", "FLEXIBLE_WORK_ARRANGEMENT_SUBTYPE-3-16"),
-    ("Other Reason", "FLEXIBLE_WORK_ARRANGEMENT_SUBTYPE-3-55"),
-    ("Remote Flexibility Benefit", "FLEXIBLE_WORK_ARRANGEMENT_SUBTYPE-3-93"),
-]
-_REASON_DESCRIPTIONS: list[str] = [
-    "Business travel, client visits, conferences, job fairs",
-    "Service provider visit, caring for an ill family member, bad weather, mild illness",
-    "Up to 15 days/year (20 if you exceed expectations) to work from an alternative location",
-]
+_LOCAL_DATE_UNAVAILABLE = (
+    "I couldn't determine today's date for your location. "
+    "Please refresh AskHR and try again."
+)
+
+# Valid reasons, resolved in code so the reason is never LLM-guessed. Keeping
+# each label, Workday subtype, and description together prevents edit drift.
+_REASONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "Business Reason",
+        "FLEXIBLE_WORK_ARRANGEMENT_SUBTYPE-3-16",
+        "Business travel, client visits, conferences, or job fairs.",
+    ),
+    (
+        "Other Reason",
+        "FLEXIBLE_WORK_ARRANGEMENT_SUBTYPE-3-55",
+        "A service provider visit, caring for an ill family member, bad weather, or mild illness.",
+    ),
+    (
+        "Remote Flexibility Benefit",
+        "FLEXIBLE_WORK_ARRANGEMENT_SUBTYPE-3-93",
+        "Up to 15 days per year—or 20 if you exceed expectations—to work from an alternative location.",
+    ),
+)
+
+_REASON_ALIASES = {
+    "business": "Business Reason",
+    "other": "Other Reason",
+    "remote flex": "Remote Flexibility Benefit",
+    "remote flexibility": "Remote Flexibility Benefit",
+    "remote flex benefit": "Remote Flexibility Benefit",
+    "remote flex benefits": "Remote Flexibility Benefit",
+}
 
 HIGH_RISK_COUNTRY_URL = (
     "https://fiservcorp.sharepoint.com/sites/fuel-dept-general-services/"
@@ -132,7 +154,7 @@ def build_submit_form(
     re-ask keeps the employee's earlier answers. An unknown ``reason_value`` is
     left unselected.
     """
-    valid_labels = [label for label, _ in _REASONS]
+    valid_labels = [label for label, _, _ in _REASONS]
     options = [{"value": label, "label": label} for label in valid_labels]
 
     start_field = {
@@ -293,7 +315,7 @@ def build_reasons_choice() -> dict:
         "title": "Which reason fits your request?",
         "options": [
             {"value": label, "label": label, "description": description}
-            for (label, _), description in zip(_REASONS, _REASON_DESCRIPTIONS)
+            for label, _, description in _REASONS
         ],
     }
 
@@ -319,9 +341,9 @@ def _bearer_headers(token: str) -> dict:
     return {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
 
 
-def _cutoff_date(days: int) -> str:
+def _cutoff_date(days: int, today: date) -> str:
     """Return the YYYY-MM-DD string for N days ago."""
-    return (datetime.now().date() - timedelta(days=days)).strftime("%Y-%m-%d")
+    return (today - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 def _get_employee_id(ctx: AgentRun) -> str | None:
@@ -336,31 +358,44 @@ def _get_employee_id(ctx: AgentRun) -> str | None:
     return str(request_context.get("employee_id") or "").strip() or None
 
 
-def _resolve_reason(reason: str) -> tuple[str | None, str | None, str | None]:
-    """Resolve a reason from a number, exact label, or partial match.
+def _get_current_date(ctx: AgentRun) -> date | None:
+    """Read the backend-generated employee-local ISO date from run context."""
+    request_context = getattr(ctx, "request_context", None)
+    if not request_context:
+        return None
+    raw = request_context.get("current_date")
+    if not isinstance(raw, str):
+        return None
+    try:
+        parsed = date.fromisoformat(raw.strip())
+    except ValueError:
+        return None
+    return parsed if raw.strip() == parsed.isoformat() else None
 
-    Accepts "1", "(1)", "1.", "1)", "#1", "Business Reason", "business", etc.
-    Returns (label, subtype_id, error_message).
-    """
+
+def _resolve_reason(reason: str) -> tuple[str | None, str | None, str | None]:
+    """Resolve only an explicit numbered, canonical, or approved reason value."""
     reason = (reason or "").strip()
     if not reason:
-        valid = " | ".join(f"{i}. {label}" for i, (label, _) in enumerate(_REASONS, 1))
+        valid = " | ".join(f"{i}. {label}" for i, (label, _, _) in enumerate(_REASONS, 1))
         return None, None, f"A reason is required. Valid options: {valid}"
 
     num = re.sub(r"^[\(#]?\s*(\d+)\s*[\)\.\,]?$", r"\1", reason)
     if num in ("1", "2", "3"):
-        label, sid = _REASONS[int(num) - 1]
+        label, sid, _ = _REASONS[int(num) - 1]
         return label, sid, None
 
-    lower = reason.lower()
-    for label, sid in _REASONS:
-        if lower == label.lower():
+    normalized = " ".join(reason.casefold().split())
+    for label, sid, _ in _REASONS:
+        if normalized == label.casefold():
             return label, sid, None
-    for label, sid in _REASONS:
-        if lower in label.lower() or label.lower() in lower:
-            return label, sid, None
+    alias_label = _REASON_ALIASES.get(normalized)
+    if alias_label:
+        for label, sid, _ in _REASONS:
+            if label == alias_label:
+                return label, sid, None
 
-    valid = " | ".join(f"{i}. {label}" for i, (label, _) in enumerate(_REASONS, 1))
+    valid = " | ".join(f"{i}. {label}" for i, (label, _, _) in enumerate(_REASONS, 1))
     return None, None, f'Invalid reason "{reason}". Valid options: {valid}'
 
 
@@ -378,9 +413,9 @@ _WEEKDAYS = {
 def _parse_relative_date(text: str, today: date) -> date | None:
     """Resolve common relative dates against ``today``.
 
-    Handles today, tomorrow, yesterday, "in N days", "next/this <weekday>", and
-    "next week". Returns a date, or None if the phrase isn't recognized. A
-    standalone agent has to resolve these itself rather than lean on the model.
+    Handles today, tomorrow, yesterday, "in N days", and
+    "next/this <weekday>". Returns a date, or None if the phrase isn't
+    recognized. Range phrases stay unresolved rather than becoming one day.
     """
     t = text.strip().lower()
     if t in ("today", "tonight"):
@@ -389,9 +424,6 @@ def _parse_relative_date(text: str, today: date) -> date | None:
         return today + timedelta(days=1)
     if t == "yesterday":
         return today - timedelta(days=1)
-    if t == "next week":
-        return today + timedelta(days=7)
-
     m = re.fullmatch(r"in (\d{1,3}) days?", t)
     if m:
         return today + timedelta(days=int(m.group(1)))
@@ -416,9 +448,6 @@ def _parse_date(raw: str, today: date | None = None) -> tuple[str | None, str | 
     artifacts like unicode spaces and ordinal suffixes.
     Returns (yyyy_mm_dd, error_message).
     """
-    if today is None:
-        today = datetime.now().date()
-
     cleaned = (raw or "").strip()
     if not cleaned:
         return None, "Date is required."
@@ -426,9 +455,10 @@ def _parse_date(raw: str, today: date | None = None) -> tuple[str | None, str | 
     cleaned = re.sub(r"[\s ​  ]+", " ", cleaned).strip()
     cleaned = re.sub(r"(\d+)(st|nd|rd|th)\b", r"\1", cleaned, flags=re.IGNORECASE)
 
-    relative = _parse_relative_date(cleaned, today)
-    if relative is not None:
-        return relative.strftime("%Y-%m-%d"), None
+    if today is not None:
+        relative = _parse_relative_date(cleaned, today)
+        if relative is not None:
+            return relative.strftime("%Y-%m-%d"), None
 
     for candidate in (cleaned, cleaned.title()):
         for fmt in _DATE_FORMATS:
@@ -444,7 +474,7 @@ def _parse_date(raw: str, today: date | None = None) -> tuple[str | None, str | 
 
 
 def _normalize_write_request(
-    start_date: str, end_date: str, reason: str,
+    start_date: str, end_date: str, reason: str, today: date,
 ) -> tuple[dict | None, str | None]:
     """Re-parse and validate confirmed write inputs. Returns (values, error).
 
@@ -452,15 +482,18 @@ def _normalize_write_request(
     never assume validate ran first. ``values`` has start, end, reason_label,
     and subtype_id.
     """
-    start_iso, err = _parse_date(start_date)
+    today_iso = today.isoformat()
+    start_iso, err = _parse_date(start_date, today)
     if err:
         return None, f"Start date: {err}"
-    end_iso, err = _parse_date(end_date)
+    end_iso, err = _parse_date(end_date, today)
     if err:
         return None, f"End date: {err}"
     reason_label, subtype_id, err = _resolve_reason(reason)
     if err:
         return None, err
+    if start_iso < today_iso:
+        return None, "The start date can't be in the past."
     if end_iso < start_iso:
         return None, "The end date can't be before the start date."
     return {
@@ -571,8 +604,16 @@ async def _fetch_requests(
         _trace_event("api.error", {"endpoint": "view", "error": "unparseable json"})
         return [], _WORKDAY_UNAVAILABLE
 
+    if not isinstance(data, dict):
+        _trace_event("api.error", {"endpoint": "view", "error": "unexpected shape"})
+        return [], _WORKDAY_UNAVAILABLE
+    entries = data.get("Report_Entry", [])
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        _trace_event("api.error", {"endpoint": "view", "error": "unexpected shape"})
+        return [], _WORKDAY_UNAVAILABLE
+
     normalized = []
-    for e in data.get("Report_Entry", []):
+    for e in entries:
         normalized.append({
             "startDate": e.get("Start_Date", e.get("startDate", "")),
             "endDate": e.get("End_Date", e.get("endDate", "")),
@@ -616,6 +657,10 @@ async def _api_submit(
         _trace_event("api.error", {"endpoint": "submit", "error": "unparseable json"})
         return {}, _WORKDAY_UNAVAILABLE
 
+    if not isinstance(result, dict):
+        _trace_event("api.error", {"endpoint": "submit", "error": "unexpected shape"})
+        return {}, _WORKDAY_UNAVAILABLE
+
     if result.get("error") or result.get("errors"):
         return {}, _WORKDAY_UNAVAILABLE
     return result, None
@@ -656,13 +701,23 @@ async def _get_end_flex_wid(
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             resp = await client.get(url, params=params, headers=headers)
         resp.raise_for_status()
-        data = resp.json()
-    except Exception:
+    except (httpx.HTTPError, httpx.InvalidURL):
         _trace_event("api.error", {"endpoint": "end_flex_wid"})
+        return None, _WORKDAY_UNAVAILABLE
+    try:
+        data = resp.json()
+    except ValueError:
+        _trace_event("api.error", {"endpoint": "end_flex_wid", "error": "unparseable json"})
+        return None, _WORKDAY_UNAVAILABLE
+    if not isinstance(data, dict):
+        _trace_event("api.error", {"endpoint": "end_flex_wid", "error": "unexpected shape"})
         return None, _WORKDAY_UNAVAILABLE
 
     entries = data.get("Report_Entry", [])
-    if entries and isinstance(entries[0], dict):
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        _trace_event("api.error", {"endpoint": "end_flex_wid", "error": "unexpected shape"})
+        return None, _WORKDAY_UNAVAILABLE
+    if entries:
         return entries[0].get("workdayID") or entries[0].get("endFlexWID"), None
     return data.get("workdayID") or data.get("endFlexWID"), None
 
@@ -710,10 +765,12 @@ async def _do_cancel_or_rescind(
 
 
 async def _select_request(
-    creds: dict, employee_id: str, request_ref: str, action: str,
+    creds: dict, employee_id: str, request_ref: str, action: str, today: date,
 ) -> tuple[dict | None, str | None]:
     """Re-fetch and match the opaque reference issued in the selection card."""
-    entries, err = await _fetch_requests(creds, employee_id, start_after=_cutoff_date(_CANCEL_MODIFY_DAYS))
+    entries, err = await _fetch_requests(
+        creds, employee_id, start_after=_cutoff_date(_CANCEL_MODIFY_DAYS, today),
+    )
     if err:
         return None, err
     if not entries:
@@ -768,8 +825,8 @@ def _format_submit_success(
 
 def _format_reason_list() -> str:
     lines = ["Here are the work-offsite reasons you can choose from:", ""]
-    for i, (label, _) in enumerate(_REASONS):
-        lines.append(f"{i + 1}. **{label}** — {_REASON_DESCRIPTIONS[i]}")
+    for i, (label, _, description) in enumerate(_REASONS):
+        lines.append(f"{i + 1}. **{label}** — {description}")
     lines.append("")
     lines.append(
         "The Remote Flexibility Benefit excludes travel-restricted countries — "
@@ -801,10 +858,14 @@ async def view_offsite_requests(
     if not eid:
         return {"text": _NO_EMPLOYEE_ID}
 
+    today = _get_current_date(context)
+    if today is None:
+        return {"text": _LOCAL_DATE_UNAVAILABLE}
+
     days_back = max(1, min(days_back, 365))
 
     creds = _get_creds()
-    entries, err = await _fetch_requests(creds, eid, start_after=_cutoff_date(days_back))
+    entries, err = await _fetch_requests(creds, eid, start_after=_cutoff_date(days_back, today))
     if err:
         return {"text": err}
 
@@ -840,8 +901,14 @@ async def list_offsite_requests_for_action(
     if not eid:
         return {"text": _NO_EMPLOYEE_ID}
 
+    today = _get_current_date(context)
+    if today is None:
+        return {"text": _LOCAL_DATE_UNAVAILABLE}
+
     creds = _get_creds()
-    entries, err = await _fetch_requests(creds, eid, start_after=_cutoff_date(_CANCEL_MODIFY_DAYS))
+    entries, err = await _fetch_requests(
+        creds, eid, start_after=_cutoff_date(_CANCEL_MODIFY_DAYS, today),
+    )
     if err:
         return {"text": err}
     if not entries:
@@ -855,6 +922,7 @@ async def list_offsite_requests_for_action(
 
 @tool
 async def validate_offsite_request(
+    context: AgentRun,
     start_date: str | None = None,
     end_date: str | None = None,
     reason: str | None = None,
@@ -873,13 +941,16 @@ async def validate_offsite_request(
       matching submit/modify tool (ok=true).
 
     Dates are parsed deterministically (including relative dates like
-    "tomorrow"); the reason resolves to a fixed subtype in code. A single date
-    fills both ends. Set ``for_modify=true`` when validating replacement details
-    for a modify so the confirm card states the request is replaced.
+    "tomorrow"); the reason resolves to a fixed subtype in code. Both start and
+    end are required; pass the same value for both only when the employee clearly
+    requests one day. Set ``for_modify=true`` when validating replacement
+    details for a modify so the confirm card states the request is replaced.
 
     Args:
+        context: Agent run context. AskHR supplies the employee-local current date.
         start_date: Start date in any common or relative format. Omit if unknown.
-        end_date: End date. Omit for a single-day request or if unknown.
+        end_date: End date. Use the start date for a clearly stated single-day
+            request; otherwise omit if unknown.
         reason: Reason label or number (1, 2, or 3). Omit if unknown.
         for_modify: True when validating replacement details for a modify.
         replacing_start: Modify only — the start date of the request being
@@ -890,7 +961,9 @@ async def validate_offsite_request(
     Returns:
         {"ok": bool, "card": <ChatBlock>, "text": str, "write_args"?: {...}, "error"?: str}
     """
-    today = datetime.now().date()
+    today = _get_current_date(context)
+    if today is None:
+        return {"ok": False, "text": _LOCAL_DATE_UNAVAILABLE}
     today_iso = today.strftime("%Y-%m-%d")
 
     everything_empty = not (start_date or "").strip() and not (end_date or "").strip() and not (reason or "").strip()
@@ -915,12 +988,6 @@ async def validate_offsite_request(
         if end_err:
             errors.append(end_err)
 
-    # A single supplied date fills both ends.
-    if start_iso and not end_iso and not (end_date or "").strip():
-        end_iso = start_iso
-    if end_iso and not start_iso and not (start_date or "").strip():
-        start_iso = end_iso
-
     reason_label, subtype_id, reason_err = (None, None, None)
     if (reason or "").strip():
         reason_label, subtype_id, reason_err = _resolve_reason(reason)
@@ -929,6 +996,8 @@ async def validate_offsite_request(
 
     if start_iso and end_iso and not start_err and not end_err and end_iso < start_iso:
         errors.append("The end date can't be before the start date.")
+    if start_iso and not start_err and start_iso < today_iso:
+        errors.append("The start date can't be in the past.")
 
     have_dates = bool(start_iso and end_iso and not start_err and not end_err and end_iso >= start_iso)
     have_reason = bool(reason_label)
@@ -962,11 +1031,19 @@ async def validate_offsite_request(
             "reason": reason_label,
         }
     )
+    confirmation_text = f"Please confirm: {start_iso} to {end_iso}, {reason_label}."
+    if for_modify:
+        replaced = f" {replacing}" if replacing else " your current request"
+        confirmation_text = (
+            f"Please confirm replacing{replaced} with {start_iso} to {end_iso}, "
+            f"{reason_label}. This cancels your current request and submits a new one."
+        )
+
     return {
         "ok": True,
         "write_args": write_args,
         "card": build_submit_confirm(start_iso, end_iso, reason_label, for_modify=for_modify, replacing=replacing),
-        "text": f"Please confirm: {start_iso} to {end_iso}, {reason_label}.",
+        "text": confirmation_text,
     }
 
 
@@ -1000,7 +1077,10 @@ async def submit_offsite_request(
     if not confirmed:
         return {"ok": False, "text": "Please confirm the request before I submit it."}
 
-    values, err = _normalize_write_request(start_date, end_date, reason)
+    today = _get_current_date(context)
+    if today is None:
+        return {"ok": False, "text": _LOCAL_DATE_UNAVAILABLE}
+    values, err = _normalize_write_request(start_date, end_date, reason, today)
     if err:
         return {"ok": False, "text": err}
 
@@ -1049,8 +1129,12 @@ async def cancel_offsite_request(
     if not eid:
         return {"ok": False, "text": _NO_EMPLOYEE_ID}
 
+    today = _get_current_date(context)
+    if today is None:
+        return {"ok": False, "text": _LOCAL_DATE_UNAVAILABLE}
+
     creds = _get_creds()
-    selected, sel_err = await _select_request(creds, eid, request_ref, "cancel")
+    selected, sel_err = await _select_request(creds, eid, request_ref, "cancel", today)
     if sel_err:
         return {"ok": False, "text": sel_err}
 
@@ -1118,12 +1202,15 @@ async def modify_offsite_request(
     if not confirmed:
         return {"ok": False, "text": "Please confirm the change before I modify the request."}
 
-    values, err = _normalize_write_request(new_start_date, new_end_date, new_reason)
+    today = _get_current_date(context)
+    if today is None:
+        return {"ok": False, "text": _LOCAL_DATE_UNAVAILABLE}
+    values, err = _normalize_write_request(new_start_date, new_end_date, new_reason, today)
     if err:
         return {"ok": False, "text": err}
 
     creds = _get_creds()
-    selected, sel_err = await _select_request(creds, eid, request_ref, "modify")
+    selected, sel_err = await _select_request(creds, eid, request_ref, "modify", today)
     if sel_err:
         return {"ok": False, "text": sel_err}
 

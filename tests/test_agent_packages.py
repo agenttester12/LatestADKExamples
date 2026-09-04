@@ -1,9 +1,12 @@
+import ast
 import asyncio
+import csv
 import importlib.util
 import re
 import sys
 import types
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -11,6 +14,14 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _offsite_context(**values):
+    return types.SimpleNamespace(request_context={
+        "employee_id": "1001",
+        "current_date": "2026-09-04",
+        **values,
+    })
 
 
 def _install_ibm_stubs() -> None:
@@ -63,6 +74,10 @@ class FakeResponse:
             raise self._body
         return self._body
 
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise AssertionError("FakeResponse error status requires an explicit HTTP error mock")
+
 
 class AgentPackageTests(unittest.TestCase):
     @classmethod
@@ -91,14 +106,20 @@ class AgentPackageTests(unittest.TestCase):
         }
         for filename, tool_names in expected_tools.items():
             spec = yaml.safe_load((ROOT / "Agents" / filename).read_text())
-            self.assertIn(spec["style"], {"default", "react", "react_core"})
+            self.assertEqual(spec["style"], "react_core")
             self.assertTrue(spec["hide_reasoning"])
             self.assertEqual(spec["tools"], tool_names)
 
         evl_spec = yaml.safe_load((ROOT / "Agents/evl_agent.yaml").read_text())
         self.assertIn("session_id", evl_spec["context_variables"])
+        self.assertNotIn("{session_id}", evl_spec["instructions"])
+        self.assertNotIn("{wd_access_token}", evl_spec["instructions"])
         self.assertTrue(
             all(guideline["tool"] == "evl_tools:evl_tools" for guideline in evl_spec["guidelines"])
+        )
+        self.assertIn(
+            "After the options have been shown in the current flow",
+            evl_spec["guidelines"][1]["condition"],
         )
 
     def test_agent_language_contract_uses_only_vetted_context(self):
@@ -120,7 +141,60 @@ class AgentPackageTests(unittest.TestCase):
             self.assertNotIn('If `response_language` is "es"', instructions)
 
         offsite_spec = yaml.safe_load((ROOT / "Agents/work_offsite_agent.yaml").read_text())
-        self.assertNotIn("preferred_language", offsite_spec["context_variables"])
+        self.assertEqual(
+            offsite_spec["context_variables"],
+            ["employee_id", "current_date", "response_language"],
+        )
+        self.assertIn("employee-local ISO date", offsite_spec["instructions"])
+
+    def test_offsite_agent_has_grounded_reason_and_presentation_rules(self):
+        spec = yaml.safe_load((ROOT / "Agents/work_offsite_agent.yaml").read_text())
+        instructions = spec["instructions"]
+        self.assertIn("Use only the reason labels and descriptions returned by", instructions)
+        self.assertIn("Recommend one reason only when the employee's stated facts clearly match", instructions)
+        self.assertIn("require the employee to choose or confirm the exact reason", instructions)
+        self.assertIn("Never print raw tool output", instructions)
+        self.assertNotIn("personal travel", instructions.lower())
+        self.assertIn("After explicit confirmation, call", instructions)
+        self.assertIn("`work_offsite_toolkit:submit_offsite_request`", instructions)
+        for protected_name in ("requestRef", "write_args", "subtype ID", "Workday ID"):
+            self.assertIn(protected_name, instructions)
+
+    def test_offsite_behavioral_evaluation_manifest_covers_critical_journeys(self):
+        with (ROOT / "evaluations/work_offsite_acceptance.csv").open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        self.assertEqual(
+            {row["case_id"] for row in rows},
+            {
+                "empty_submit", "sister_visit", "ill_sister", "client_visit",
+                "mixed_reason", "missing_end", "past_date", "confirmed_submit",
+                "declined_submit",
+            },
+        )
+        self.assertTrue(all(all(value.strip() for value in row.values()) for row in rows))
+
+    def test_platform_card_tool_has_no_network_or_connection_dependency(self):
+        source = (ROOT / "Tools/askhr_platform_tools/tools.py").read_text()
+        imports = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                imports.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imports.add(node.module or "")
+        self.assertEqual(imports, {"ibm_watsonx_orchestrate.agent_builder.tools"})
+
+        requirements = [
+            line.strip()
+            for line in (ROOT / "Tools/askhr_platform_tools/requirements.txt").read_text().splitlines()
+            if line.strip()
+        ]
+        self.assertEqual(requirements, ["ibm-watsonx-orchestrate==2.15.0"])
+
+        offsite_source = (ROOT / "Tools/work_offsite_toolkit/tools.py").read_text()
+        for obsolete_key in ("config_url", "config_api_key", "resolve_token_url"):
+            self.assertNotIn(obsolete_key, offsite_source)
+        self.assertNotIn("orchestrate tools import", offsite_source)
 
     def test_requirements_use_exact_stable_versions(self):
         for path in (
@@ -321,10 +395,11 @@ class AgentPackageTests(unittest.TestCase):
 
     def test_offsite_validation_returns_exact_write_arguments(self):
         submit = asyncio.run(self.offsite.validate_offsite_request(
-            "2026-09-10", "2026-09-10", "Business Reason",
+            _offsite_context(), "2026-09-10", "2026-09-10", "Business Reason",
         ))
         modify = asyncio.run(self.offsite.validate_offsite_request(
-            "2026-09-12", "2026-09-12", "Remote Flexibility Benefit", for_modify=True,
+            _offsite_context(), "2026-09-12", "2026-09-12",
+            "Remote Flexibility Benefit", for_modify=True,
         ))
 
         self.assertEqual(submit["write_args"], {
@@ -337,7 +412,181 @@ class AgentPackageTests(unittest.TestCase):
             "new_end_date": "2026-09-12",
             "new_reason": "Remote Flexibility Benefit",
         })
+        self.assertIn("cancels your current request and submits a new one", modify["text"])
         self.assertNotIn("normalized", submit)
+
+    def test_offsite_modify_confirmation_fallback_names_replacement_and_effect(self):
+        result = asyncio.run(self.offsite.validate_offsite_request(
+            _offsite_context(),
+            "2026-09-12", "2026-09-13", "Other Reason",
+            for_modify=True,
+            replacing_start="2026-09-10",
+            replacing_end="2026-09-11",
+            replacing_reason="Business Reason",
+        ))
+
+        self.assertTrue(result["ok"])
+        for expected in (
+            "2026-09-10 → 2026-09-11 (Business Reason)",
+            "2026-09-12 to 2026-09-13",
+            "Other Reason",
+            "cancels your current request and submits a new one",
+        ):
+            self.assertIn(expected, result["text"])
+
+    def test_offsite_reason_resolution_rejects_narrative_or_mixed_values(self):
+        accepted = {
+            "1": "Business Reason",
+            "business": "Business Reason",
+            "Other Reason": "Other Reason",
+            "remote flex": "Remote Flexibility Benefit",
+            "remote flexibility benefit": "Remote Flexibility Benefit",
+        }
+        for raw, expected_label in accepted.items():
+            label, subtype_id, error = self.offsite._resolve_reason(raw)
+            self.assertEqual(label, expected_label)
+            self.assertTrue(subtype_id)
+            self.assertIsNone(error)
+
+        for raw in (
+            "not Business Reason",
+            "Business Reason or Other Reason",
+            "helping my sister in Florida",
+            "business travel",
+        ):
+            label, subtype_id, error = self.offsite._resolve_reason(raw)
+            self.assertIsNone(label)
+            self.assertIsNone(subtype_id)
+            self.assertIn("Valid options", error)
+
+    def test_offsite_end_date_without_start_stays_partial(self):
+        result = asyncio.run(self.offsite.validate_offsite_request(
+            _offsite_context(),
+            end_date="2026-09-10",
+            reason="Business Reason",
+        ))
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["card"]["kind"], "form")
+        fields = {field["id"]: field for field in result["card"]["fields"]}
+        self.assertNotIn("value", fields["start_date"])
+        self.assertEqual(fields["end_date"]["value"], "2026-09-10")
+
+    def test_offsite_start_date_without_end_stays_partial(self):
+        result = asyncio.run(self.offsite.validate_offsite_request(
+            _offsite_context(),
+            start_date="2099-09-10",
+            reason="Business Reason",
+        ))
+
+        self.assertFalse(result["ok"])
+        fields = {field["id"]: field for field in result["card"]["fields"]}
+        self.assertEqual(fields["start_date"]["value"], "2099-09-10")
+        self.assertNotIn("value", fields["end_date"])
+
+    def test_offsite_rejects_past_dates_at_validation_and_write_boundary(self):
+        validation = asyncio.run(self.offsite.validate_offsite_request(
+            _offsite_context(),
+            start_date="2000-01-01",
+            end_date="2000-01-02",
+            reason="Business Reason",
+        ))
+        normalized, write_error = self.offsite._normalize_write_request(
+            "2000-01-01", "2000-01-02", "Business Reason", date(2026, 9, 4),
+        )
+
+        self.assertFalse(validation["ok"])
+        self.assertIn("past", validation["error"].lower())
+        self.assertIsNone(normalized)
+        self.assertIn("past", write_error.lower())
+
+    def test_offsite_does_not_turn_range_language_into_one_date(self):
+        parsed, error = self.offsite._parse_date("next week", date(2026, 9, 4))
+
+        self.assertIsNone(parsed)
+        self.assertIn("Could not parse", error)
+
+    def test_offsite_date_resolution_uses_only_trusted_current_date_context(self):
+        tomorrow = asyncio.run(self.offsite.validate_offsite_request(
+            _offsite_context(current_date="2026-12-31"),
+            "tomorrow", "tomorrow", "Business Reason",
+        ))
+        missing = asyncio.run(self.offsite.validate_offsite_request(
+            _offsite_context(current_date=""),
+            "2027-01-01", "2027-01-01", "Business Reason",
+        ))
+
+        self.assertEqual(tomorrow["write_args"]["start_date"], "2027-01-01")
+        self.assertFalse(missing["ok"])
+        self.assertIn("refresh AskHR", missing["text"])
+
+    def test_offsite_unexpected_programming_error_is_not_masked_as_outage(self):
+        with patch.object(self.offsite.httpx, "AsyncClient", side_effect=RuntimeError("programming defect")):
+            with self.assertRaisesRegex(RuntimeError, "programming defect"):
+                asyncio.run(self.offsite._get_end_flex_wid(
+                    {
+                        "get_end_flex_url": "https://example.test",
+                        "workday_user": "test-user",
+                        "workday_pass": "test-password",
+                    },
+                    "1001", "2026-09-10", "2026-09-10", "type-1",
+                ))
+
+    def test_offsite_end_flex_lookup_rejects_non_object_json_safely(self):
+        for payload in (None, [], "unexpected", {"Report_Entry": None}, {"Report_Entry": ["bad"]}):
+            response = FakeResponse(200, payload)
+            with patch.object(self.offsite.httpx, "AsyncClient") as client_type:
+                client_type.return_value.__aenter__ = AsyncMock(return_value=client_type.return_value)
+                client_type.return_value.__aexit__ = AsyncMock(return_value=None)
+                client_type.return_value.get = AsyncMock(return_value=response)
+                wid, error = asyncio.run(self.offsite._get_end_flex_wid(
+                    {
+                        "get_end_flex_url": "https://example.test",
+                        "workday_user": "test-user",
+                        "workday_pass": "test-password",
+                    },
+                    "1001", "2099-09-10", "2099-09-11", "type-1",
+                ))
+
+            self.assertIsNone(wid)
+            self.assertEqual(error, self.offsite._WORKDAY_UNAVAILABLE)
+
+    def test_offsite_view_and_submit_reject_unexpected_json_shapes_safely(self):
+        malformed_view_payloads = (
+            None,
+            [],
+            "unexpected",
+            {"Report_Entry": None},
+            {"Report_Entry": ["bad"]},
+        )
+        for payload in malformed_view_payloads:
+            response = FakeResponse(200, payload)
+            with patch.object(self.offsite.httpx, "AsyncClient") as client_type:
+                client_type.return_value.__aenter__ = AsyncMock(return_value=client_type.return_value)
+                client_type.return_value.__aexit__ = AsyncMock(return_value=None)
+                client_type.return_value.get = AsyncMock(return_value=response)
+                entries, error = asyncio.run(self.offsite._fetch_requests({
+                    "view_flex_url": "https://example.test/view",
+                    "workday_user": "test-user",
+                    "workday_pass": "test-password",
+                }, "1001"))
+
+            self.assertEqual(entries, [])
+            self.assertEqual(error, self.offsite._WORKDAY_UNAVAILABLE)
+
+        for payload in (None, [], "unexpected"):
+            response = FakeResponse(200, payload)
+            with patch.object(self.offsite.httpx, "AsyncClient") as client_type:
+                client_type.return_value.__aenter__ = AsyncMock(return_value=client_type.return_value)
+                client_type.return_value.__aexit__ = AsyncMock(return_value=None)
+                client_type.return_value.post = AsyncMock(return_value=response)
+                result, error = asyncio.run(self.offsite._api_submit(
+                    "token", "https://api.example/add", "1001",
+                    "2026-09-10", "2026-09-10", "type-1",
+                ))
+
+            self.assertEqual(result, {})
+            self.assertEqual(error, self.offsite._WORKDAY_UNAVAILABLE)
 
     def test_offsite_does_not_surface_upstream_error_content(self):
         response = FakeResponse(400, {
@@ -404,14 +653,16 @@ class AgentPackageTests(unittest.TestCase):
 
         with patch.object(self.offsite, "_fetch_requests", new=AsyncMock(return_value=([second, first], None))):
             selected, error = asyncio.run(
-                self.offsite._select_request({}, "1001", request_ref, "cancel")
+                self.offsite._select_request(
+                    {}, "1001", request_ref, "cancel", date(2026, 9, 4),
+                )
             )
 
         self.assertIsNone(error)
         self.assertEqual(selected["workdayID"], "wid-1")
 
     def test_offsite_success_has_machine_readable_completion_marker(self):
-        context = types.SimpleNamespace(request_context={"employee_id": "1001"})
+        context = _offsite_context()
         normalized = {
             "start": "2026-09-10", "end": "2026-09-10",
             "reason_label": "Business Reason", "subtype_id": "type-1",
@@ -428,7 +679,7 @@ class AgentPackageTests(unittest.TestCase):
         self.assertEqual(result["action_type"], "work_offsite_submit")
 
     def test_offsite_cancel_and_modify_success_markers_are_explicit(self):
-        context = types.SimpleNamespace(request_context={"employee_id": "1001"})
+        context = _offsite_context()
         entry = {
             "startDate": "2026-09-10", "endDate": "2026-09-10", "status": "In Progress",
             "subtype": "Business Reason", "subtypeID": "type-1", "workdayID": "wid-1", "flexComplete": "0",
@@ -461,7 +712,7 @@ class AgentPackageTests(unittest.TestCase):
         self.assertTrue(modify["ok"])
 
     def test_offsite_write_tools_refuse_unconfirmed_calls(self):
-        context = types.SimpleNamespace(request_context={"employee_id": "1001"})
+        context = _offsite_context()
         submit = asyncio.run(self.offsite.submit_offsite_request(
             context, "2026-09-10", "2026-09-10", "Business Reason",
         ))
